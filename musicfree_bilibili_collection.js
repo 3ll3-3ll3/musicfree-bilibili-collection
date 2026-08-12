@@ -7,7 +7,8 @@
  * - 新版 B 站空间合集：/lists/<id>?type=season
  * - B 站空间系列：/lists/<id>?type=series
  * - 公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID
- * - 一次粘贴多个歌单链接：一行一个（也会尽量提取每行中的 URL）
+ * - 一次粘贴多个歌单链接：一行一个
+ * - 自动展开多P视频为独立歌曲，并保持原有顺序
  *
  * 基于 maotoumao/MusicFreePlugins 的 bilibili 插件接口风格编写。
  */
@@ -20,6 +21,8 @@ const headers = {
   accept: "*/*",
   "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
 };
+
+const EXPAND_CONCURRENCY = 3;
 
 function durationToSec(duration) {
   if (typeof duration === "number") return duration;
@@ -63,6 +66,12 @@ function parseImportEntries(urlLike) {
 }
 
 function getMediaDedupeKey(item) {
+  if (item?.bvid && item?.cid != null) {
+    return `bvid:${item.bvid}:cid:${item.cid}`;
+  }
+  if (item?.aid != null && item?.cid != null) {
+    return `aid:${item.aid}:cid:${item.cid}`;
+  }
   if (item?.bvid) return `bvid:${item.bvid}`;
   if (item?.aid != null) return `aid:${item.aid}`;
   if (item?.cid != null) return `cid:${item.cid}`;
@@ -82,6 +91,28 @@ function dedupeMediaItems(items) {
   }
 
   return result;
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runner() {
+    while (true) {
+      const currentIndex = nextIndex++;
+      if (currentIndex >= items.length) return;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const runnerCount = Math.min(
+    Math.max(1, concurrency || 1),
+    Math.max(1, items.length)
+  );
+
+  await Promise.all(Array.from({ length: runnerCount }, () => runner()));
+
+  return results;
 }
 
 async function getCid(bvid, aid) {
@@ -274,6 +305,88 @@ async function getSeriesList(mid, seriesId, sourceUrl) {
   }));
 }
 
+function buildExpandedAlbumName(item) {
+  const parentAlbum = item?.album;
+  const parentTitle = item?.title || "多P视频";
+
+  if (
+    parentAlbum &&
+    parentAlbum !== item?.bvid &&
+    String(parentAlbum) !== String(item?.aid)
+  ) {
+    return `${parentAlbum} / ${parentTitle}`;
+  }
+
+  return parentTitle;
+}
+
+async function expandMediaItem(item) {
+  if (!item?.bvid && item?.aid == null) {
+    return [item];
+  }
+
+  if (item?.cid != null && item?._expandedMultiPage) {
+    return [item];
+  }
+
+  try {
+    const cidRes = await getCid(item.bvid, item.aid);
+    const data = cidRes?.data || {};
+    const pages = Array.isArray(data.pages) ? data.pages : [];
+
+    if (pages.length <= 1) {
+      const onlyPage = pages[0];
+      return [
+        {
+          ...item,
+          cid: item.cid ?? data.cid ?? onlyPage?.cid,
+          duration:
+            item.duration ||
+            durationToSec(onlyPage?.duration) ||
+            durationToSec(data.duration),
+        },
+      ];
+    }
+
+    const expandedAlbum = buildExpandedAlbumName(item);
+
+    return pages.map((page, index) => ({
+      ...item,
+      id: `${item.bvid ?? item.aid}:${page.cid}`,
+      cid: page.cid,
+      title:
+        page.part || `${item.title || "多P视频"} P${page.page ?? index + 1}`,
+      album: expandedAlbum,
+      duration: durationToSec(page.duration),
+      page: page.page ?? index + 1,
+      parentTitle: item.title,
+      _expandedMultiPage: true,
+    }));
+  } catch (error) {
+    console.warn(
+      `[bilibili合集] 多P检查失败，保留原视频：${
+        item?.title || item?.bvid || item?.aid
+      }`,
+      error
+    );
+    return [item];
+  }
+}
+
+async function expandImportedMediaItems(items) {
+  const expandedGroups = await mapWithConcurrency(
+    items || [],
+    EXPAND_CONCURRENCY,
+    expandMediaItem
+  );
+
+  const flattened = [];
+  for (const group of expandedGroups) {
+    if (Array.isArray(group)) flattened.push(...group);
+  }
+  return flattened;
+}
+
 async function importSingleMusicSheet(input) {
   const listMatch = input.match(
     /space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i
@@ -326,18 +439,24 @@ async function importMusicSheet(urlLike) {
     }
   }
 
-  const result = dedupeMediaItems(merged);
-
-  if (!result.length) {
+  if (!merged.length) {
     const detail = failed.length ? `\n${failed.join("\n")}` : "";
     throw new Error(`没有成功导入任何歌单。${detail}`);
   }
 
+  const expanded = await expandImportedMediaItems(merged);
+  const result = dedupeMediaItems(expanded);
+
+  if (!result.length) {
+    const detail = failed.length ? `\n${failed.join("\n")}` : "";
+    throw new Error(`没有成功生成任何歌曲。${detail}`);
+  }
+
   if (failed.length) {
     console.warn(
-      `[bilibili合集] ${entries.length} 个输入中有 ${failed.length} 个导入失败：\n${failed.join(
-        "\n"
-      )}`
+      `[bilibili合集] ${entries.length} 个输入中有 ${
+        failed.length
+      } 个导入失败：\n${failed.join("\n")}`
     );
   }
 
@@ -411,6 +530,12 @@ async function getMediaSource(musicItem, quality) {
 }
 
 async function getAlbumInfo(albumItem) {
+  if (albumItem?.cid != null && albumItem?._expandedMultiPage) {
+    return {
+      musicList: [albumItem],
+    };
+  }
+
   const cidRes = await getCid(albumItem.bvid, albumItem.aid);
   const data = cidRes?.data || {};
   const pages = data.pages || [];
@@ -420,19 +545,23 @@ async function getAlbumInfo(albumItem) {
       musicList: [
         {
           ...albumItem,
-          cid: data.cid,
+          cid: albumItem.cid ?? data.cid ?? pages[0]?.cid,
         },
       ],
     };
   }
 
   return {
-    musicList: pages.map((item) => ({
+    musicList: pages.map((item, index) => ({
       ...albumItem,
       cid: item.cid,
-      id: item.cid,
+      id: `${albumItem.bvid ?? albumItem.aid}:${item.cid}`,
       title: item.part,
+      album: buildExpandedAlbumName(albumItem),
       duration: durationToSec(item.duration),
+      page: item.page ?? index + 1,
+      parentTitle: albumItem.title,
+      _expandedMultiPage: true,
     })),
   };
 }
@@ -440,7 +569,7 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.2.0",
+  version: "0.2.1",
   author: "3ll3-3ll3",
   srcUrl:
     "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
@@ -450,10 +579,11 @@ module.exports = {
   hints: {
     importMusicSheet: [
       "支持一次粘贴多个链接：每行一个，自动识别、合并并去重",
+      "自动展开多P视频：每个分P会作为独立歌曲导入，并保持原顺序",
       "支持新版 B站空间合集：https://space.bilibili.com/<mid>/lists/<id>?type=season",
       "支持 B站空间系列：https://space.bilibili.com/<mid>/lists/<id>?type=series",
       "同时兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID",
-      "批量导入会顺序读取各歌单；部分链接失败时，其余成功内容仍会导入",
+      "多P检查采用限并发请求；单个视频检查失败时会保留原视频，不影响其他内容",
     ],
   },
 
