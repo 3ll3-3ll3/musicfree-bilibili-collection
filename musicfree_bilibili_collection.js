@@ -1,13 +1,13 @@
 "use strict";
 
 /**
- * MusicFree Bilibili 合集导入插件
- * 目标：支持新版 B 站空间合集链接：
- * https://space.bilibili.com/<mid>/lists/<season_id>?type=season
+ * MusicFree Bilibili 合集批量导入插件
  *
- * 同时兼容：
- * - type=series 的“列表/系列”
- * - 原 Bilibili 插件支持的公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID
+ * 支持：
+ * - 新版 B 站空间合集：/lists/<id>?type=season
+ * - B 站空间系列：/lists/<id>?type=series
+ * - 公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID
+ * - 一次粘贴多个歌单链接：一行一个（也会尽量提取每行中的 URL）
  *
  * 基于 maotoumao/MusicFreePlugins 的 bilibili 插件接口风格编写。
  */
@@ -24,9 +24,64 @@ const headers = {
 function durationToSec(duration) {
   if (typeof duration === "number") return duration;
   if (typeof duration === "string") {
-    return duration.split(":").reduce((prev, curr) => 60 * prev + Number(curr), 0);
+    return duration
+      .split(":")
+      .reduce((prev, curr) => 60 * prev + Number(curr), 0);
   }
   return 0;
+}
+
+function cleanInputToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[，。；;、）)\]}>》」』]+$/g, "");
+}
+
+function parseImportEntries(urlLike) {
+  const lines = String(urlLike || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const entries = [];
+
+  for (const line of lines) {
+    const urls = line.match(/https?:\/\/[^\s]+/gi);
+
+    if (urls?.length) {
+      for (const url of urls) {
+        const cleaned = cleanInputToken(url);
+        if (cleaned) entries.push(cleaned);
+      }
+    } else {
+      const cleaned = cleanInputToken(line);
+      if (cleaned) entries.push(cleaned);
+    }
+  }
+
+  return [...new Set(entries)];
+}
+
+function getMediaDedupeKey(item) {
+  if (item?.bvid) return `bvid:${item.bvid}`;
+  if (item?.aid != null) return `aid:${item.aid}`;
+  if (item?.cid != null) return `cid:${item.cid}`;
+  if (item?.id != null) return `id:${item.id}`;
+  return `${item?.title || ""}|${item?.artist || ""}|${item?.duration || ""}`;
+}
+
+function dedupeMediaItems(items) {
+  const seen = new Set();
+  const result = [];
+
+  for (const item of items || []) {
+    const key = getMediaDedupeKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+  }
+
+  return result;
 }
 
 async function getCid(bvid, aid) {
@@ -48,7 +103,10 @@ async function getUploaderName(mid, referer) {
   try {
     const res = (
       await axios.get("https://api.bilibili.com/x/web-interface/card", {
-        headers: { ...headers, referer: referer || `https://space.bilibili.com/${mid}` },
+        headers: {
+          ...headers,
+          referer: referer || `https://space.bilibili.com/${mid}`,
+        },
         params: { mid },
       })
     ).data;
@@ -151,7 +209,9 @@ async function getSeasonList(mid, seasonId, sourceUrl) {
     artist: uploader,
     album: albumName,
     duration: durationToSec(item.duration),
-    date: item.pubdate ? new Date(item.pubdate * 1000).toISOString().slice(0, 10) : undefined,
+    date: item.pubdate
+      ? new Date(item.pubdate * 1000).toISOString().slice(0, 10)
+      : undefined,
   }));
 }
 
@@ -208,15 +268,13 @@ async function getSeriesList(mid, seriesId, sourceUrl) {
     artist: uploader,
     album: seriesName,
     duration: durationToSec(item.duration),
-    date: item.pubdate ? new Date(item.pubdate * 1000).toISOString().slice(0, 10) : undefined,
+    date: item.pubdate
+      ? new Date(item.pubdate * 1000).toISOString().slice(0, 10)
+      : undefined,
   }));
 }
 
-async function importMusicSheet(urlLike) {
-  const input = String(urlLike || "").trim();
-
-  // 新版空间“合集和系列”：
-  // https://space.bilibili.com/33114953/lists/5469118?type=season
+async function importSingleMusicSheet(input) {
   const listMatch = input.match(
     /space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i
   );
@@ -232,7 +290,6 @@ async function importMusicSheet(urlLike) {
     return await getSeasonList(mid, listId, input);
   }
 
-  // 兼容旧收藏夹导入格式
   let id;
   if (!id) id = input.match(/^\s*(\d+)\s*$/)?.[1];
   if (!id) id = input.match(/^(?:.*)fid=(\d+).*$/)?.[1];
@@ -243,9 +300,48 @@ async function importMusicSheet(urlLike) {
     return await getFavoriteList(id);
   }
 
-  throw new Error(
-    "无法识别链接。请粘贴 B站空间 /lists/<ID>?type=season（或 type=series）链接，或公开收藏夹链接。"
-  );
+  throw new Error("无法识别该链接或歌单 ID");
+}
+
+async function importMusicSheet(urlLike) {
+  const entries = parseImportEntries(urlLike);
+
+  if (!entries.length) {
+    throw new Error("请输入至少一个 Bilibili 歌单/合集链接");
+  }
+
+  const merged = [];
+  const failed = [];
+
+  for (const entry of entries) {
+    try {
+      const items = await importSingleMusicSheet(entry);
+      if (Array.isArray(items)) {
+        merged.push(...items);
+      }
+    } catch (error) {
+      const message = error?.message || String(error);
+      failed.push(`${entry} -> ${message}`);
+      console.warn(`[bilibili合集] 导入失败：${entry}`, error);
+    }
+  }
+
+  const result = dedupeMediaItems(merged);
+
+  if (!result.length) {
+    const detail = failed.length ? `\n${failed.join("\n")}` : "";
+    throw new Error(`没有成功导入任何歌单。${detail}`);
+  }
+
+  if (failed.length) {
+    console.warn(
+      `[bilibili合集] ${entries.length} 个输入中有 ${failed.length} 个导入失败：\n${failed.join(
+        "\n"
+      )}`
+    );
+  }
+
+  return result;
 }
 
 async function getMediaSource(musicItem, quality) {
@@ -289,7 +385,8 @@ async function getMediaSource(musicItem, quality) {
     };
 
     const wanted = qualityIndex[quality] ?? sorted.length - 1;
-    const selected = sorted[Math.min(wanted, sorted.length - 1)] || sorted[0];
+    const selected =
+      sorted[Math.min(wanted, sorted.length - 1)] || sorted[0];
     url = selected.baseUrl || selected.base_url;
   } else if (res.data?.durl?.length) {
     url = res.data.durl[0].url;
@@ -306,7 +403,9 @@ async function getMediaSource(musicItem, quality) {
       ...headers,
       host: parsed.host,
       connection: "keep-alive",
-      referer: `https://www.bilibili.com/video/${musicItem.bvid ?? musicItem.aid ?? ""}`,
+      referer: `https://www.bilibili.com/video/${
+        musicItem.bvid ?? musicItem.aid ?? ""
+      }`,
     },
   };
 }
@@ -341,22 +440,23 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.1.0",
+  version: "0.2.0",
   author: "3ll3-3ll3",
-  srcUrl: "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
+  srcUrl:
+    "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
   primaryKey: ["id", "aid", "bvid", "cid"],
 
   hints: {
     importMusicSheet: [
+      "支持一次粘贴多个链接：每行一个，自动识别、合并并去重",
       "支持新版 B站空间合集：https://space.bilibili.com/<mid>/lists/<id>?type=season",
       "支持 B站空间系列：https://space.bilibili.com/<mid>/lists/<id>?type=series",
       "同时兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID",
-      "合集较大时会自动分页读取，请稍等。",
+      "批量导入会顺序读取各歌单；部分链接失败时，其余成功内容仍会导入",
     ],
   },
 
-  // 这个插件专门负责“导入 B站合集并播放”，不提供搜索页。
   supportedSearchType: [],
 
   async search() {
