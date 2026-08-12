@@ -569,10 +569,10 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.2.1",
+  version: "0.2.2",
   author: "3ll3-3ll3",
   srcUrl:
-    "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
+    "https://cdn.jsdelivr.net/gh/3ll3-3ll3/musicfree-bilibili-collection@main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
   primaryKey: ["id", "aid", "bvid", "cid"],
 
