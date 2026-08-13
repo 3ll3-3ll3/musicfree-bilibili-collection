@@ -3,16 +3,19 @@
 /**
  * MusicFree Bilibili 合集批量导入插件 - Cotton Music optimized
  *
- * v0.5.1
+ * v0.5.2
  * - 支持空间合集 / 系列 / 收藏夹 / 多链接合并 / 多P展开
- * - 将 MusicFree 原生 low / standard / high / super 映射成 4 个明确音质档位
+ * - 支持 maxDurationMinutes：按分钟过滤超长音频；0/留空=不限
+ * - 多P按每个分P自身时长过滤，不按整个视频总时长过滤
+ * - 导入阶段过滤 + 下载阶段再次校验，旧歌单也不会误下超长音频
+ * - low / standard / high / super 映射为 4 个明确音质档位
  * - low      -> 最低可用 AAC（通常约 64K）
  * - standard -> 优先 B站 30232（通常约 128/132K）
  * - high     -> 优先 B站 30280 / 最高普通 AAC（通常约 192K）
  * - super    -> 原生 FLAC 优先；没有 FLAC 时回退最高普通 AAC
- * - 普通 AAC 下载保存为 Cotton Music 友好的 .m4a 文件名
+ * - 普通 AAC 保存为 Cotton Music 友好的 .m4a 文件名
  * - FLAC DASH 不伪装扩展名，交给 Cotton Normalizer 无损抽取
- * - 自动更新源改为 GitHub Raw，避免 jsDelivr @main 缓存导致版本滞后
+ * - 自动更新源使用 GitHub Raw
  */
 
 const axios = require("axios");
@@ -51,13 +54,62 @@ function buildHeaders(extra) {
 }
 
 function durationToSec(duration) {
-  if (typeof duration === "number") return duration;
+  if (typeof duration === "number") {
+    return Number.isFinite(duration) && duration > 0 ? duration : 0;
+  }
   if (typeof duration === "string") {
-    return duration
-      .split(":")
-      .reduce((prev, curr) => 60 * prev + Number(curr), 0);
+    const text = duration.trim();
+    if (!text) return 0;
+    if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+    const parts = text.split(":").map(Number);
+    if (parts.some((part) => !Number.isFinite(part))) return 0;
+    return parts.reduce((prev, curr) => 60 * prev + curr, 0);
   }
   return 0;
+}
+
+function getMaxDurationMinutes() {
+  const vars = getUserVariables();
+  const raw = String(vars.maxDurationMinutes ?? "").trim();
+  if (!raw) return 0;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function isOverDurationLimit(durationSec) {
+  const maxMinutes = getMaxDurationMinutes();
+  const seconds = durationToSec(durationSec);
+  if (maxMinutes <= 0 || seconds <= 0) return false;
+  return seconds > maxMinutes * 60;
+}
+
+function filterByDuration(items, context) {
+  const maxMinutes = getMaxDurationMinutes();
+  if (maxMinutes <= 0) return items || [];
+
+  const kept = [];
+  const removed = [];
+  for (const item of items || []) {
+    if (isOverDurationLimit(item?.duration)) removed.push(item);
+    else kept.push(item);
+  }
+
+  if (removed.length) {
+    console.log(
+      `[bilibili合集] 时长过滤${context ? `(${context})` : ""}：` +
+        `上限=${maxMinutes}min，过滤=${removed.length}，保留=${kept.length}`
+    );
+    for (const item of removed.slice(0, 20)) {
+      console.log(
+        `[bilibili合集] 已过滤：${item?.title || item?.bvid || item?.aid || "未知"} | ` +
+          `${Math.round((durationToSec(item?.duration) / 60) * 10) / 10}min`
+      );
+    }
+    if (removed.length > 20) {
+      console.log(`[bilibili合集] 另有 ${removed.length - 20} 条超长内容未逐条打印`);
+    }
+  }
+  return kept;
 }
 
 function cleanInputToken(value) {
@@ -89,12 +141,8 @@ function parseImportEntries(urlLike) {
 }
 
 function getMediaDedupeKey(item) {
-  if (item?.bvid && item?.cid != null) {
-    return `bvid:${item.bvid}:cid:${item.cid}`;
-  }
-  if (item?.aid != null && item?.cid != null) {
-    return `aid:${item.aid}:cid:${item.cid}`;
-  }
+  if (item?.bvid && item?.cid != null) return `bvid:${item.bvid}:cid:${item.cid}`;
+  if (item?.aid != null && item?.cid != null) return `aid:${item.aid}:cid:${item.cid}`;
   if (item?.bvid) return `bvid:${item.bvid}`;
   if (item?.aid != null) return `aid:${item.aid}`;
   if (item?.cid != null) return `cid:${item.cid}`;
@@ -135,12 +183,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
 }
 
 function qualityHints() {
-  return {
-    low: {},
-    standard: {},
-    high: {},
-    super: {},
-  };
+  return { low: {}, standard: {}, high: {}, super: {} };
 }
 
 function normalizeArtwork(url) {
@@ -188,12 +231,7 @@ async function getFavoriteList(id) {
     const res = (
       await axios.get("https://api.bilibili.com/x/v3/fav/resource/list", {
         headers: buildHeaders(),
-        params: {
-          media_id: id,
-          platform: "web",
-          ps: pageSize,
-          pn: page,
-        },
+        params: { media_id: id, platform: "web", ps: pageSize, pn: page },
       })
     ).data;
 
@@ -251,7 +289,6 @@ async function getSeasonList(mid, seasonId, sourceUrl) {
     meta = meta || data.meta || {};
     const archives = data.archives || [];
     result.push(...archives);
-
     total = data.page?.total ?? meta.total ?? result.length;
     if (!archives.length || result.length >= total) break;
     page += 1;
@@ -297,12 +334,7 @@ async function getSeriesList(mid, seriesId, sourceUrl) {
     const res = (
       await axios.get("https://api.bilibili.com/x/series/archives", {
         headers: buildHeaders({ referer: sourceUrl }),
-        params: {
-          mid,
-          series_id: seriesId,
-          pn: page,
-          ps: pageSize,
-        },
+        params: { mid, series_id: seriesId, pn: page, ps: pageSize },
       })
     ).data;
 
@@ -338,7 +370,6 @@ async function getSeriesList(mid, seriesId, sourceUrl) {
 function buildExpandedAlbumName(item) {
   const parentAlbum = item?.album;
   const parentTitle = item?.title || "多P视频";
-
   if (
     parentAlbum &&
     parentAlbum !== item?.bvid &&
@@ -404,7 +435,6 @@ async function expandImportedMediaItems(items) {
     EXPAND_CONCURRENCY,
     expandMediaItem
   );
-
   const flattened = [];
   for (const group of expandedGroups) {
     if (Array.isArray(group)) flattened.push(...group);
@@ -413,10 +443,7 @@ async function expandImportedMediaItems(items) {
 }
 
 async function importSingleMusicSheet(input) {
-  const listMatch = input.match(
-    /space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i
-  );
-
+  const listMatch = input.match(/space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i);
   if (listMatch) {
     const mid = listMatch[1];
     const listId = listMatch[2];
@@ -444,7 +471,6 @@ async function importMusicSheet(urlLike) {
 
   const merged = [];
   const failed = [];
-
   for (const entry of entries) {
     try {
       const items = await importSingleMusicSheet(entry);
@@ -462,11 +488,14 @@ async function importMusicSheet(urlLike) {
   }
 
   const expanded = await expandImportedMediaItems(merged);
-  const result = dedupeMediaItems(expanded);
+  const deduped = dedupeMediaItems(expanded);
+  const result = filterByDuration(deduped, "导入");
 
   if (!result.length) {
+    const maxMinutes = getMaxDurationMinutes();
+    const limitHint = maxMinutes > 0 ? `；当前时长上限为 ${maxMinutes} 分钟` : "";
     const detail = failed.length ? `\n${failed.join("\n")}` : "";
-    throw new Error(`没有成功生成任何歌曲。${detail}`);
+    throw new Error(`没有成功生成任何歌曲${limitHint}。${detail}`);
   }
 
   if (failed.length) {
@@ -474,7 +503,6 @@ async function importMusicSheet(urlLike) {
       `[bilibili合集] ${entries.length} 个输入中有 ${failed.length} 个导入失败：\n${failed.join("\n")}`
     );
   }
-
   return result;
 }
 
@@ -523,7 +551,6 @@ function pickRegularAudio(audios, quality) {
   if (quality === "low") {
     return findById(usable, AUDIO_IDS.low) || usable[0];
   }
-
   if (quality === "standard") {
     return (
       findById(usable, AUDIO_IDS.standard) ||
@@ -531,11 +558,9 @@ function pickRegularAudio(audios, quality) {
       usable[Math.min(1, usable.length - 1)]
     );
   }
-
   if (quality === "high") {
     return findById(usable, AUDIO_IDS.high) || usable[usable.length - 1];
   }
-
   return findById(usable, AUDIO_IDS.high) || usable[usable.length - 1];
 }
 
@@ -546,7 +571,6 @@ function pickAudioSource(dash, quality) {
   if (quality === "super") {
     const lossless = sortByBandwidthAscending(flac).at(-1);
     if (lossless) return { track: lossless, kind: "flac" };
-
     const fallback = pickRegularAudio(regular, "high");
     return fallback ? { track: fallback, kind: "aac" } : null;
   }
@@ -597,7 +621,48 @@ async function getPlayurlData(musicItem, cid) {
   ).data;
 }
 
+async function resolveDurationForLimit(musicItem) {
+  const known = durationToSec(musicItem?.duration);
+  if (known > 0) return known;
+  if (getMaxDurationMinutes() <= 0) return 0;
+  if (!musicItem?.bvid && musicItem?.aid == null) return 0;
+
+  try {
+    const cidRes = await getCid(musicItem.bvid, musicItem.aid);
+    const data = cidRes?.data || {};
+    const pages = Array.isArray(data.pages) ? data.pages : [];
+    if (musicItem?.cid != null) {
+      const page = pages.find(
+        (p) => String(p?.cid) === String(musicItem.cid)
+      );
+      const pageDuration = durationToSec(page?.duration);
+      if (pageDuration > 0) return pageDuration;
+    }
+    if (pages.length === 1) {
+      const pageDuration = durationToSec(pages[0]?.duration);
+      if (pageDuration > 0) return pageDuration;
+    }
+    return durationToSec(data.duration);
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function assertDurationAllowed(musicItem) {
+  const maxMinutes = getMaxDurationMinutes();
+  if (maxMinutes <= 0) return;
+  const duration = await resolveDurationForLimit(musicItem);
+  if (duration > maxMinutes * 60) {
+    const actualMinutes = Math.round((duration / 60) * 10) / 10;
+    throw new Error(
+      `时长过滤：${musicItem?.title || "该音频"} 为 ${actualMinutes} 分钟，超过 ${maxMinutes} 分钟上限`
+    );
+  }
+}
+
 async function getMediaSource(musicItem, quality) {
+  await assertDurationAllowed(musicItem);
+
   let cid = musicItem.cid;
   if (!cid) {
     cid = (await getCid(musicItem.bvid, musicItem.aid)).data.cid;
@@ -611,9 +676,7 @@ async function getMediaSource(musicItem, quality) {
 
   const res = await getPlayurlData(musicItem, cid);
   if (res.code !== 0 || !res.data) {
-    throw new Error(
-      `Bilibili 音频地址获取失败：${res.message || res.code}`
-    );
+    throw new Error(`Bilibili 音频地址获取失败：${res.message || res.code}`);
   }
 
   let rawUrl;
@@ -631,9 +694,7 @@ async function getMediaSource(musicItem, quality) {
     rawUrl = res.data.durl[0].url;
   }
 
-  if (!rawUrl) {
-    throw new Error("Bilibili 没有返回可播放的音频地址");
-  }
+  if (!rawUrl) throw new Error("Bilibili 没有返回可播放的音频地址");
 
   const kbps = selectedTrack?.bandwidth
     ? Math.round(selectedTrack.bandwidth / 1000)
@@ -665,7 +726,7 @@ async function getMediaSource(musicItem, quality) {
 
 async function getAlbumInfo(albumItem) {
   if (albumItem?.cid != null && albumItem?._expandedMultiPage) {
-    return { musicList: [albumItem] };
+    return { musicList: filterByDuration([albumItem], "专辑") };
   }
 
   const cidRes = await getCid(albumItem.bvid, albumItem.aid);
@@ -673,40 +734,43 @@ async function getAlbumInfo(albumItem) {
   const pages = data.pages || [];
 
   if (pages.length <= 1) {
-    return {
-      musicList: [
-        {
-          ...albumItem,
-          cid: albumItem.cid ?? data.cid ?? pages[0]?.cid,
-          qualities: albumItem.qualities || qualityHints(),
-        },
-      ],
-    };
+    const musicList = [
+      {
+        ...albumItem,
+        cid: albumItem.cid ?? data.cid ?? pages[0]?.cid,
+        duration:
+          durationToSec(albumItem?.duration) ||
+          durationToSec(pages[0]?.duration) ||
+          durationToSec(data.duration),
+        qualities: albumItem.qualities || qualityHints(),
+      },
+    ];
+    return { musicList: filterByDuration(musicList, "专辑") };
   }
 
-  return {
-    musicList: pages.map((item, index) => ({
-      ...albumItem,
-      cid: item.cid,
-      id: `${albumItem.bvid ?? albumItem.aid}:${item.cid}`,
-      title: item.part,
-      album: buildExpandedAlbumName(albumItem),
-      duration: durationToSec(item.duration),
-      page: item.page ?? index + 1,
-      parentTitle: albumItem.title,
-      _expandedMultiPage: true,
-      qualities: albumItem.qualities || qualityHints(),
-    })),
-  };
+  const musicList = pages.map((item, index) => ({
+    ...albumItem,
+    cid: item.cid,
+    id: `${albumItem.bvid ?? albumItem.aid}:${item.cid}`,
+    title: item.part,
+    album: buildExpandedAlbumName(albumItem),
+    duration: durationToSec(item.duration),
+    page: item.page ?? index + 1,
+    parentTitle: albumItem.title,
+    _expandedMultiPage: true,
+    qualities: albumItem.qualities || qualityHints(),
+  }));
+
+  return { musicList: filterByDuration(musicList, "专辑多P") };
 }
 
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.5.1",
+  version: "0.5.2",
   author: "3ll3-3ll3",
   description:
-    "Bilibili 合集/系列批量导入；四档音质：省流 / 标准 / 高音质 / 无损优先",
+    "Bilibili 合集/系列批量导入；四档音质 + 可配置分钟级时长过滤",
   srcUrl:
     "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
@@ -719,6 +783,10 @@ module.exports = {
       type: "password",
     },
     {
+      key: "maxDurationMinutes",
+      name: "最大音频时长（分钟）：如 30 / 60；0 或留空表示不限制",
+    },
+    {
       key: "downloadExtMode",
       name: "下载后缀模式：auto（默认）/ raw（保留 CDN 原始后缀）",
     },
@@ -726,12 +794,13 @@ module.exports = {
 
   hints: {
     importMusicSheet: [
-      "v0.5 四档音质：low=省流AAC，standard=标准AAC，high=最高AAC，super=FLAC优先",
+      "v0.5.2 新增时长过滤：maxDurationMinutes 填分钟数，例如 30 / 60；0 或留空表示不限",
+      "超过上限的内容不会进入导入结果；多P视频按每个分P自身时长分别判断",
+      "下载时还会再次校验时长，因此旧歌单中的超长条目也会被阻止下载",
+      "四档音质：low=省流AAC，standard=标准AAC，high=最高AAC，super=FLAC优先",
       "super 没有原生 FLAC 时自动回退最高 AAC，不会把 AAC 伪装成 FLAC",
       "支持一次粘贴多个链接：每行一个，自动识别、合并并去重",
-      "自动展开多P视频：每个分P作为独立歌曲导入，并保持原顺序",
-      "支持新版 B站空间合集 /lists/<id>?type=season 和空间系列 type=series",
-      "兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID",
+      "支持新版 B站空间合集 /lists/<id>?type=season、空间系列 type=series、公开收藏夹",
     ],
   },
 
