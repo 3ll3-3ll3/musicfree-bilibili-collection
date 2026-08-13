@@ -1,0 +1,117 @@
+diff --git a/src/renderer/core/downloader/index.ts b/src/renderer/core/downloader/index.ts
+--- a/src/renderer/core/downloader/index.ts
++++ b/src/renderer/core/downloader/index.ts
+@@
+ async function startDownload(
+     musicItems: IMusic.IMusicItem | IMusic.IMusicItem[],
++    requestedQuality?: IMusic.IQualityKey,
+ ) {
+@@
+-                downloadMusicImpl(it, fileName, (stateData) => {
++                downloadMusicImpl(it, fileName, (stateData) => {
+                     downloadingProgress.set(pk, stateData);
+@@
+-                });
++                }, requestedQuality);
+@@
+ async function downloadMusicImpl(
+     musicItem: IMusic.IMusicItem,
+     fileName: string,
+     onStateChange: IOnStateChangeFunc,
++    requestedQuality?: IMusic.IQualityKey,
+ ) {
+@@
+-    const qualityOrder = getQualityOrder(defaultQuality, whenQualityMissing);
++    const qualityOrder = getQualityOrder(
++        requestedQuality ?? defaultQuality,
++        whenQualityMissing,
++    );
+
+diff --git a/src/renderer/components/MusicList/index.tsx b/src/renderer/components/MusicList/index.tsx
+--- a/src/renderer/components/MusicList/index.tsx
++++ b/src/renderer/components/MusicList/index.tsx
+@@
+     menuItems.push(
+         {
+             title: i18n.t("common.download"),
+             icon: "array-download-tray",
+@@
+-            onClick() {
+-                Downloader.startDownload(musicItems);
+-            },
++            subMenu: [
++                {
++                    title: "省流 AAC（约 64K）",
++                    onClick() {
++                        Downloader.startDownload(musicItems, "low");
++                    },
++                },
++                {
++                    title: "标准 AAC（约 128K）",
++                    onClick() {
++                        Downloader.startDownload(musicItems, "standard");
++                    },
++                },
++                {
++                    title: "高音质 AAC（约 192K）",
++                    onClick() {
++                        Downloader.startDownload(musicItems, "high");
++                    },
++                },
++                {
++                    title: "无损优先（FLAC / 最高 AAC）",
++                    onClick() {
++                        Downloader.startDownload(musicItems, "super");
++                    },
++                },
++            ],
+         },
+
+diff --git a/src/renderer/components/MusicDownloaded/index.tsx b/src/renderer/components/MusicDownloaded/index.tsx
+--- a/src/renderer/components/MusicDownloaded/index.tsx
++++ b/src/renderer/components/MusicDownloaded/index.tsx
+@@
+ import Downloader from "@/renderer/core/downloader";
+ import { useTranslation } from "react-i18next";
++import { showContextMenu } from "../ContextMenu";
+@@
+-            onClick={() => {
++            onClick={(evt) => {
+                 if (
+                     musicItem && (downloadState === DownloadState.NONE ||
+                 downloadState === DownloadState.ERROR)
+                 ) {
+-                    Downloader.startDownload(musicItem);
++                    evt.stopPropagation();
++                    showContextMenu({
++                        x: evt.clientX,
++                        y: evt.clientY,
++                        menuItems: [
++                            {
++                                title: "省流 AAC（约 64K）",
++                                onClick() {
++                                    Downloader.startDownload(musicItem, "low");
++                                },
++                            },
++                            {
++                                title: "标准 AAC（约 128K）",
++                                onClick() {
++                                    Downloader.startDownload(musicItem, "standard");
++                                },
++                            },
++                            {
++                                title: "高音质 AAC（约 192K）",
++                                onClick() {
++                                    Downloader.startDownload(musicItem, "high");
++                                },
++                            },
++                            {
++                                title: "无损优先（FLAC / 最高 AAC）",
++                                onClick() {
++                                    Downloader.startDownload(musicItem, "super");
++                                },
++                            },
++                        ],
++                    });
+                 }
+             }}
