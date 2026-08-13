@@ -3,7 +3,7 @@
 /**
  * MusicFree Bilibili 合集批量导入插件 - Cotton Music optimized
  *
- * v0.5.0
+ * v0.5.1
  * - 支持空间合集 / 系列 / 收藏夹 / 多链接合并 / 多P展开
  * - 将 MusicFree 原生 low / standard / high / super 映射成 4 个明确音质档位
  * - low      -> 最低可用 AAC（通常约 64K）
@@ -12,6 +12,7 @@
  * - super    -> 原生 FLAC 优先；没有 FLAC 时回退最高普通 AAC
  * - 普通 AAC 下载保存为 Cotton Music 友好的 .m4a 文件名
  * - FLAC DASH 不伪装扩展名，交给 Cotton Normalizer 无损抽取
+ * - 自动更新源改为 GitHub Raw，避免 jsDelivr @main 缓存导致版本滞后
  */
 
 const axios = require("axios");
@@ -553,7 +554,6 @@ function pickAudioSource(dash, quality) {
   const selected = pickRegularAudio(regular, quality || "standard");
   if (selected) return { track: selected, kind: "aac" };
 
-  // 极端情况下没有普通 AAC，super 之外也允许 FLAC 兜底，避免完全无法播放。
   const fallbackFlac = sortByBandwidthAscending(flac).at(-1);
   return fallbackFlac ? { track: fallbackFlac, kind: "flac" } : null;
 }
@@ -566,7 +566,6 @@ function addDownloadExtensionHint(url, ext) {
 
   try {
     const parsed = new URL(url);
-    // URL fragment 不会发送给 B站 CDN；MusicFreeDesktop 会从完整 URL 猜后缀。
     parsed.hash = `.${ext}`;
     return parsed.toString();
   } catch (_) {
@@ -648,8 +647,6 @@ async function getMediaSource(musicItem, quality) {
   );
 
   const parsed = new URL(rawUrl);
-  // AAC 可以安全地给 MusicFree 一个 .m4a 文件名；FLAC 仍是 DASH/fMP4 容器，
-  // 不直接伪装成 .flac，后续由 Cotton Normalizer 使用 ffmpeg -c copy 抽取。
   const outputExt = kind === "aac" ? "m4a" : null;
   const finalUrl = addDownloadExtensionHint(rawUrl, outputExt);
 
@@ -706,12 +703,12 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.5.0",
+  version: "0.5.1",
   author: "3ll3-3ll3",
   description:
     "Bilibili 合集/系列批量导入；四档音质：省流 / 标准 / 高音质 / 无损优先",
   srcUrl:
-    "https://cdn.jsdelivr.net/gh/3ll3-3ll3/musicfree-bilibili-collection@main/musicfree_bilibili_collection.js",
+    "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
   primaryKey: ["id", "aid", "bvid", "cid"],
 
