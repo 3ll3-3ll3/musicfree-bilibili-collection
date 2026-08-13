@@ -3,11 +3,13 @@
 /**
  * MusicFree Bilibili 合集批量导入插件 - Cotton Music optimized
  *
- * v0.3.0:
+ * v0.4.0
  * - 新版空间合集 / 系列 / 收藏夹 / 多链接合并 / 多P展开
- * - 优先选择 Cotton Music 兼容的 AAC-in-MP4 音频
- * - MusicFree Desktop 下载时默认保存为 .m4a，而不是 B 站 CDN 的 .m4s 后缀
- * - 可选 B 站 Cookie，用于访问账号本身可用的更高音质/受限内容
+ * - playurl 请求升级到 fnval=4048，读取 regular / FLAC / Dolby 音轨
+ * - 默认 best 策略：原生 FLAC > 最高码率 AAC；不把 AAC 伪装成 FLAC
+ * - AAC 下载保持 Cotton 友好的 .m4a 文件名
+ * - FLAC / Dolby 保留分段容器后缀，交给仓库内 Cotton Normalizer 无损抽取/封装
+ * - 可选 B 站 Cookie
  */
 
 const axios = require("axios");
@@ -43,9 +45,7 @@ function buildHeaders(extra) {
 function durationToSec(duration) {
   if (typeof duration === "number") return duration;
   if (typeof duration === "string") {
-    return duration
-      .split(":")
-      .reduce((prev, curr) => 60 * prev + Number(curr), 0);
+    return duration.split(":").reduce((prev, curr) => 60 * prev + Number(curr), 0);
   }
   return 0;
 }
@@ -366,39 +366,86 @@ async function importMusicSheet(urlLike) {
 }
 
 function trackUrl(track) {
-  return track?.baseUrl || track?.base_url || track?.backupUrl?.[0] || track?.backup_url?.[0];
+  return track?.baseUrl || track?.base_url || track?.url || track?.backupUrl?.[0] || track?.backup_url?.[0];
 }
 
-function isCottonFriendlyTrack(track) {
-  const mime = String(track?.mimeType || track?.mime_type || "").toLowerCase();
-  const codecs = String(track?.codecs || "").toLowerCase();
-  // Bilibili 常规 DASH 音频通常是 AAC in fragmented MP4。
-  // mime/codecs 缺失时不强行排除，以免旧接口数据全部失效。
-  const mimeOk = !mime || mime.includes("audio/mp4");
-  const codecOk = !codecs || codecs.includes("mp4a");
-  return mimeOk && codecOk;
+function asTrackList(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value.filter(Boolean) : [value];
 }
 
-function pickAudioTrack(audios, quality) {
-  const usable = (audios || []).filter((track) => !!trackUrl(track));
+function sortHighestFirst(tracks) {
+  return [...tracks].sort((a, b) => {
+    const bw = (b?.bandwidth || 0) - (a?.bandwidth || 0);
+    if (bw) return bw;
+    return (b?.id || 0) - (a?.id || 0);
+  });
+}
+
+function getAudioPolicy() {
+  const vars = getUserVariables();
+  const value = String(vars.audioPolicy || "best").trim().toLowerCase();
+  if (["best", "aac", "follow", "dolby"].includes(value)) return value;
+  return "best";
+}
+
+function pickRegularAudio(audios, quality, followMusicFree) {
+  const usable = sortHighestFirst(
+    asTrackList(audios).filter((track) => !!trackUrl(track))
+  );
   if (!usable.length) return null;
-  const compatible = usable.filter(isCottonFriendlyTrack);
-  const pool = compatible.length ? compatible : usable;
-  const sorted = [...pool].sort((a, b) => (a.bandwidth || 0) - (b.bandwidth || 0));
+  if (!followMusicFree) return usable[0];
+
+  // 只有显式 audioPolicy=follow 时才沿用 MusicFree low/standard/high/super 分档。
+  // 默认 best 不再受 MusicFreeDesktop 的 standard 默认值限制。
+  const ascending = [...usable].reverse();
   const qualityIndex = { low: 0, standard: 1, high: 2, super: 3 };
-  const wanted = qualityIndex[quality] ?? sorted.length - 1;
-  return sorted[Math.min(wanted, sorted.length - 1)] || sorted[0];
+  const wanted = qualityIndex[quality] ?? ascending.length - 1;
+  return ascending[Math.min(wanted, ascending.length - 1)] || ascending[0];
+}
+
+function pickAudioSource(dash, quality) {
+  const policy = getAudioPolicy();
+  const flac = asTrackList(dash?.flac?.audio).filter((track) => !!trackUrl(track));
+  const dolby = asTrackList(dash?.dolby?.audio).filter((track) => !!trackUrl(track));
+  const regular = asTrackList(dash?.audio).filter((track) => !!trackUrl(track));
+
+  if (policy === "dolby") {
+    const track = sortHighestFirst(dolby)[0] || sortHighestFirst(flac)[0] || pickRegularAudio(regular, quality, false);
+    if (!track) return null;
+    const kind = dolby.includes(track) ? "dolby" : flac.includes(track) ? "flac" : "aac";
+    return { track, kind };
+  }
+
+  if (policy === "best") {
+    // Cotton Music 场景优先真正无损 FLAC；Dolby 不默认选择，避免多声道/编码兼容问题。
+    const lossless = sortHighestFirst(flac)[0];
+    if (lossless) return { track: lossless, kind: "flac" };
+    const aac = pickRegularAudio(regular, quality, false);
+    if (aac) return { track: aac, kind: "aac" };
+    const fallbackDolby = sortHighestFirst(dolby)[0];
+    return fallbackDolby ? { track: fallbackDolby, kind: "dolby" } : null;
+  }
+
+  if (policy === "aac") {
+    const aac = pickRegularAudio(regular, quality, false);
+    return aac ? { track: aac, kind: "aac" } : null;
+  }
+
+  const followed = pickRegularAudio(regular, quality, true);
+  if (followed) return { track: followed, kind: "aac" };
+  const lossless = sortHighestFirst(flac)[0];
+  return lossless ? { track: lossless, kind: "flac" } : null;
 }
 
 function addDownloadExtensionHint(url, ext) {
   const vars = getUserVariables();
-  const mode = String(vars.downloadExtMode || "m4a").trim().toLowerCase();
+  const mode = String(vars.downloadExtMode || "auto").trim().toLowerCase();
   if (mode === "raw" || mode === "off" || mode === "关闭") return url;
   if (!ext) return url;
   try {
     const parsed = new URL(url);
-    // URL fragment 不会发送给 Bilibili CDN；MusicFree Desktop 的下载器却会
-    // 从完整 URL 猜扩展名，因此 '#.m4a' 可让文件保存成 .m4a 而不改变请求。
+    // fragment 不会发送给 CDN，但 MusicFreeDesktop 会从完整 URL 猜下载扩展名。
     parsed.hash = `.${ext}`;
     return parsed.toString();
   } catch (_) {
@@ -406,34 +453,56 @@ function addDownloadExtensionHint(url, ext) {
   }
 }
 
+async function getPlayurlData(musicItem, cid) {
+  const videoParams = musicItem.bvid
+    ? { bvid: musicItem.bvid }
+    : { aid: musicItem.aid };
+
+  return (
+    await axios.get("https://api.bilibili.com/x/player/playurl", {
+      headers: buildHeaders({
+        referer: `https://www.bilibili.com/video/${musicItem.bvid ?? musicItem.aid ?? ""}`,
+      }),
+      params: {
+        ...videoParams,
+        cid,
+        qn: 127,
+        fnval: 4048,
+        fnver: 0,
+        fourk: 1,
+      },
+    })
+  ).data;
+}
+
 async function getMediaSource(musicItem, quality) {
   let cid = musicItem.cid;
   if (!cid) cid = (await getCid(musicItem.bvid, musicItem.aid)).data.cid;
-  const videoParams = musicItem.bvid ? { bvid: musicItem.bvid } : { aid: musicItem.aid };
-  const res = (
-    await axios.get("https://api.bilibili.com/x/player/playurl", {
-      headers: buildHeaders(),
-      params: { ...videoParams, cid, fnval: 16 },
-    })
-  ).data;
+
+  const res = await getPlayurlData(musicItem, cid);
   if (res.code !== 0 || !res.data) {
     throw new Error(`Bilibili 音频地址获取失败：${res.message || res.code}`);
   }
 
   let rawUrl;
-  let outputExt;
-  const audios = res.data?.dash?.audio;
-  if (Array.isArray(audios) && audios.length) {
-    const selected = pickAudioTrack(audios, quality);
-    rawUrl = trackUrl(selected);
-    if (selected && isCottonFriendlyTrack(selected)) outputExt = "m4a";
+  let kind = "unknown";
+  if (res.data?.dash) {
+    const selected = pickAudioSource(res.data.dash, quality);
+    if (selected) {
+      rawUrl = trackUrl(selected.track);
+      kind = selected.kind;
+    }
   } else if (res.data?.durl?.length) {
     rawUrl = res.data.durl[0].url;
   }
   if (!rawUrl) throw new Error("Bilibili 没有返回可播放的音频地址");
 
   const parsed = new URL(rawUrl);
+  // AAC 可以直接给 MusicFree 一个 m4a 文件名；FLAC/Dolby 仍是 DASH 分段容器，
+  // 不伪装成 .flac，交给 tools/cotton-normalizer.ps1 用 ffmpeg -c copy 真正抽取。
+  const outputExt = kind === "aac" ? "m4a" : null;
   const finalUrl = addDownloadExtensionHint(rawUrl, outputExt);
+
   return {
     url: finalUrl,
     headers: {
@@ -475,9 +544,9 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.3.0",
+  version: "0.4.0",
   author: "3ll3-3ll3",
-  description: "Bilibili 合集/系列批量导入；Cotton Music 兼容下载模式默认输出 .m4a",
+  description: "Bilibili 合集/系列批量导入；默认原生 FLAC > 最高 AAC，并为 Cotton Music 提供无损规范化流程",
   srcUrl:
     "https://cdn.jsdelivr.net/gh/3ll3-3ll3/musicfree-bilibili-collection@main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
@@ -485,23 +554,27 @@ module.exports = {
   userVariables: [
     {
       key: "biliCookie",
-      name: "B站 Cookie（可选；用于账号可访问的高音质/受限内容）",
+      name: "B站 Cookie（可选；用于账号本身可访问的高音质/受限内容）",
       type: "password",
     },
     {
+      key: "audioPolicy",
+      name: "音质策略：best（默认 FLAC>最高AAC）/ aac / follow / dolby",
+    },
+    {
       key: "downloadExtMode",
-      name: "下载后缀模式：m4a（默认）/ raw（保留原始后缀）",
+      name: "下载后缀模式：auto（默认）/ raw（完全保留 CDN 后缀）",
     },
   ],
   hints: {
     importMusicSheet: [
-      "Cotton Music 模式：常规 DASH AAC 音频下载时默认保存为 .m4a，不再直接落成 .m4s",
+      "v0.4 默认 best：存在原生 FLAC 时优先 FLAC，否则选普通 DASH 中最高码率 AAC",
+      "MusicFreeDesktop 默认 standard 不再限制 best/aac 策略；只有 audioPolicy=follow 才跟随其音质分档",
+      "AAC 下载会保存为 .m4a；FLAC/Dolby 不会伪装扩展名，请用仓库 tools/cotton-normalizer.ps1 无损规范化",
       "支持一次粘贴多个链接：每行一个，自动识别、合并并去重",
-      "自动展开多P视频：每个分P会作为独立歌曲导入，并保持原顺序",
-      "支持新版 B站空间合集：https://space.bilibili.com/<mid>/lists/<id>?type=season",
-      "支持 B站空间系列：https://space.bilibili.com/<mid>/lists/<id>?type=series",
-      "同时兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID",
-      "如需保留 B站 CDN 原始扩展名，在插件用户变量 downloadExtMode 填 raw",
+      "自动展开多P视频：每个分P作为独立歌曲导入，并保持原顺序",
+      "支持新版 B站空间合集 /lists/<id>?type=season 和空间系列 type=series",
+      "兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID",
     ],
   },
   supportedSearchType: [],
