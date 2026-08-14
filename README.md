@@ -4,14 +4,14 @@
 
 ## 当前版本
 
-`v0.5.3`
+`v0.5.4`
 
 ## 当前核心功能
 
 - 支持新版 B站空间合集：`/lists/<id>?type=season`
 - 支持 B站空间系列：`/lists/<id>?type=series`
 - 兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID
-- 支持一次粘贴多个歌单链接，一行一个，自动识别、合并并去重
+- 支持一次粘贴多个歌单/视频链接；推荐一行一个，即使 MusicFree 单行输入框吞掉换行也能自动恢复多个 URL；同时支持空格、逗号、分号、竖线分隔
 - 自动识别多P视频，并将每个分P展开成独立歌曲
 - 支持直接粘贴单个 BV/AV 视频链接或裸 BV/av ID，将视频选集直接当作歌单导入
 - 支持 `b23.tv` 短链接自动解析
@@ -19,6 +19,27 @@
 - 多P去重优先使用 `bvid + cid`
 - 可选 B站 Cookie，用于账号本身有权访问的内容/音质
 - 支持按分钟设置最大音频时长，自动过滤超长内容
+
+## v0.5.4：多链接粘贴兼容
+
+MusicFreeDesktop 当前导入窗口使用单行 `<input>`，不是 `<textarea>`。因此你从文本里粘贴：
+
+```text
+https://www.bilibili.com/video/BVxxxxxxxxxx/
+https://www.bilibili.com/video/BVyyyyyyyyyy/
+```
+
+界面上可能会被压成一行，甚至变成两个 URL 紧挨着。v0.5.4 不再依赖换行本身，而是扫描每一个 `http://` / `https://` 起点，因此即使变成：
+
+```text
+https://...BVxxxxxxxxxx/https://...BVyyyyyyyyyy/
+```
+
+也会恢复成两条独立导入任务。
+
+同时支持空格、逗号、中文逗号、分号、中文分号、竖线分隔，以及批量裸 `BV...` / `av...` ID。
+
+> 注意：MusicFreeDesktop 当前导入框本身限制最大 1000 字符。一次导入很多带 `spm_id_from` / `vd_source` 的长链接时，建议去掉追踪参数或直接粘贴 BV 号，以免宿主在插件收到内容前就截断。
 
 ## v0.5.3：单视频 / 视频选集直接导入
 

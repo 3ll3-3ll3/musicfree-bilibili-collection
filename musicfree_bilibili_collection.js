@@ -3,7 +3,9 @@
 /**
  * MusicFree Bilibili 合集批量导入插件 - Cotton Music optimized
  *
- * v0.5.3
+ * v0.5.4
+ * - 改进多链接导入：即使 MusicFree 单行输入框吞掉换行，也能自动拆分连续 URL
+ * - 支持空格 / 换行 / 逗号 / 分号 / 竖线分隔，以及多个裸 BV/av ID 批量导入
  * - 支持直接导入单个 BV/AV 视频；多P/视频选集直接展开为独立歌曲
  * - 支持 b23.tv 短链接自动解析
  * - 支持空间合集 / 系列 / 收藏夹 / 多链接合并 / 多P展开
@@ -120,26 +122,56 @@ function cleanInputToken(value) {
     .replace(/[，。；;、）)\]}>》」』]+$/g, "");
 }
 
-function parseImportEntries(urlLike) {
-  const lines = String(urlLike || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function extractHttpUrls(text) {
+  const source = String(text || "");
+  const starts = [];
+  const re = /https?:\/\//gi;
+  let match;
+  while ((match = re.exec(source))) starts.push(match.index);
+  if (!starts.length) return [];
 
-  const entries = [];
-  for (const line of lines) {
-    const urls = line.match(/https?:\/\/[^\s]+/gi);
-    if (urls?.length) {
-      for (const url of urls) {
-        const cleaned = cleanInputToken(url);
-        if (cleaned) entries.push(cleaned);
-      }
-    } else {
-      const cleaned = cleanInputToken(line);
-      if (cleaned) entries.push(cleaned);
-    }
+  const urls = [];
+  for (let i = 0; i < starts.length; i += 1) {
+    const start = starts[i];
+    const end = starts[i + 1] ?? source.length;
+    let chunk = source.slice(start, end).trim();
+
+    // MusicFreeDesktop 当前使用单行 input；粘贴多行文本时换行可能被吞掉，
+    // 导致两个 URL 直接粘在一起。按下一个 http(s):// 起点切片即可恢复。
+    const whitespaceIndex = chunk.search(/\s/);
+    if (whitespaceIndex >= 0) chunk = chunk.slice(0, whitespaceIndex);
+
+    const cleaned = cleanInputToken(chunk);
+    if (cleaned) urls.push(cleaned);
   }
-  return [...new Set(entries)];
+  return urls;
+}
+
+function parseImportEntries(urlLike) {
+  const text = String(urlLike || "").trim();
+  if (!text) return [];
+
+  // 优先提取所有完整 URL。即使宿主输入框把换行删掉，形如
+  // "https://...BV1/...https://...BV2/..." 也能正确拆成两条。
+  const urls = extractHttpUrls(text);
+  if (urls.length) return [...new Set(urls)];
+
+  // 没有完整 URL 时，兼容裸 BV/av ID。即使多行粘贴后连在一起，
+  // 仍可通过固定格式逐个提取。
+  const videoIds = text.match(/BV[0-9A-Za-z]{10}|av\d+/gi);
+  if (videoIds?.length) {
+    return [...new Set(videoIds.map(cleanInputToken).filter(Boolean))];
+  }
+
+  // 收藏夹数字 ID / 其他旧格式保留分隔符解析；支持空格、换行、逗号、分号、竖线。
+  return [
+    ...new Set(
+      text
+        .split(/[\s,，;；|]+/)
+        .map(cleanInputToken)
+        .filter(Boolean)
+    ),
+  ];
 }
 
 function getMediaDedupeKey(item) {
@@ -893,7 +925,7 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.5.3",
+  version: "0.5.4",
   author: "3ll3-3ll3",
   description:
     "Bilibili 合集/系列/单视频选集导入；四档音质 + 可配置分钟级时长过滤",
@@ -920,14 +952,15 @@ module.exports = {
 
   hints: {
     importMusicSheet: [
-      "v0.5.3 支持直接粘贴 BV/AV 视频链接、裸 BV/av ID；多P/视频选集会自动拆成独立歌曲",
+      "v0.5.4 改进多链接导入：可直接多行粘贴；即使输入框把换行显示成一行，也会自动识别多个 URL",
+      "支持空格 / 逗号 / 分号 / 竖线分隔多个链接，也支持多个裸 BV/av ID 批量粘贴",
       "支持 b23.tv 短链自动解析，手机分享链接可直接尝试导入",
       "时长过滤：maxDurationMinutes 填分钟数，例如 30 / 60；0 或留空表示不限",
       "超过上限的内容不会进入导入结果；多P视频按每个分P自身时长分别判断",
       "下载时还会再次校验时长，因此旧歌单中的超长条目也会被阻止下载",
       "四档音质：low=省流AAC，standard=标准AAC，high=最高AAC，super=FLAC优先",
       "super 没有原生 FLAC 时自动回退最高 AAC，不会把 AAC 伪装成 FLAC",
-      "支持一次粘贴多个链接：每行一个，自动识别、合并并去重",
+      "支持一次粘贴多个链接：推荐一行一个；宿主吞掉换行时插件仍会按每个 http(s):// 自动拆分、合并并去重",
       "支持新版 B站空间合集 /lists/<id>?type=season、空间系列 type=series、公开收藏夹",
     ],
   },
