@@ -3,7 +3,9 @@
 /**
  * MusicFree Bilibili 合集批量导入插件 - Cotton Music optimized
  *
- * v0.5.2
+ * v0.5.3
+ * - 支持直接导入单个 BV/AV 视频；多P/视频选集直接展开为独立歌曲
+ * - 支持 b23.tv 短链接自动解析
  * - 支持空间合集 / 系列 / 收藏夹 / 多链接合并 / 多P展开
  * - 支持 maxDurationMinutes：按分钟过滤超长音频；0/留空=不限
  * - 多P按每个分P自身时长过滤，不按整个视频总时长过滤
@@ -191,6 +193,63 @@ function normalizeArtwork(url) {
   return String(url).startsWith("//") ? `https:${url}` : url;
 }
 
+function parseVideoIdentifier(input) {
+  const text = String(input || "").trim();
+  if (!text) return null;
+
+  const bvidMatch =
+    text.match(/(?:\/video\/|^)(BV[0-9A-Za-z]{10})(?:[/?#]|$)/i) ||
+    text.match(/\b(BV[0-9A-Za-z]{10})\b/i);
+  if (bvidMatch) return { bvid: bvidMatch[1] };
+
+  const aidMatch =
+    text.match(/(?:\/video\/|^)av(\d+)(?:[/?#]|$)/i) ||
+    text.match(/\bav(\d+)\b/i);
+  if (aidMatch) return { aid: Number(aidMatch[1]) };
+
+  return null;
+}
+
+function getAxiosFinalUrl(response) {
+  return (
+    response?.request?.res?.responseUrl ||
+    response?.request?.responseURL ||
+    response?.request?._currentUrl ||
+    null
+  );
+}
+
+async function resolveB23Url(input) {
+  const url = String(input || "").trim();
+  if (!/^https?:\/\/(?:www\.)?b23\.tv\//i.test(url)) return url;
+
+  let response;
+  try {
+    response = await axios.head(url, {
+      headers: buildHeaders(),
+      maxRedirects: 5,
+    });
+  } catch (_) {
+    response = await axios.get(url, {
+      headers: buildHeaders(),
+      maxRedirects: 5,
+    });
+  }
+
+  const finalUrl = getAxiosFinalUrl(response);
+  if (
+    finalUrl &&
+    !/^https?:\/\/(?:www\.)?b23\.tv\//i.test(finalUrl)
+  ) {
+    console.log(`[bilibili合集] 短链解析：${url} -> ${finalUrl}`);
+    return finalUrl;
+  }
+
+  throw new Error(
+    "B站 b23.tv 短链解析失败，请改用展开后的 bilibili.com 链接"
+  );
+}
+
 async function getCid(bvid, aid) {
   const params = bvid ? { bvid } : { aid };
   const res = (
@@ -204,6 +263,66 @@ async function getCid(bvid, aid) {
     throw new Error(`Bilibili 获取视频信息失败：${res.message || res.code}`);
   }
   return res;
+}
+
+async function getSingleVideoList(identifier, sourceUrl) {
+  const view = await getCid(identifier?.bvid, identifier?.aid);
+  const data = view?.data || {};
+  const bvid = data.bvid || identifier?.bvid;
+  const aid = data.aid ?? identifier?.aid;
+  const pages = Array.isArray(data.pages) ? data.pages : [];
+  const videoTitle =
+    data.title || bvid || (aid != null ? `av${aid}` : "Bilibili 视频");
+  const artist = data.owner?.name || "Bilibili";
+  const artwork = normalizeArtwork(data.pic);
+  const date = data.pubdate
+    ? new Date(data.pubdate * 1000).toISOString().slice(0, 10)
+    : undefined;
+
+  const base = {
+    id: bvid ?? aid,
+    aid,
+    bvid,
+    artwork,
+    title: videoTitle,
+    artist,
+    album: videoTitle,
+    duration: durationToSec(data.duration),
+    date,
+    sourceUrl,
+    qualities: qualityHints(),
+  };
+
+  if (pages.length <= 1) {
+    const page = pages[0];
+    return [
+      {
+        ...base,
+        id: `${bvid ?? aid}:${page?.cid ?? data.cid ?? "main"}`,
+        cid: page?.cid ?? data.cid,
+        duration:
+          durationToSec(page?.duration) || durationToSec(data.duration),
+        page: page?.page ?? 1,
+        _expandedMultiPage: true,
+      },
+    ];
+  }
+
+  console.log(
+    `[bilibili合集] 单视频选集：${videoTitle} | 共 ${pages.length} 个分P`
+  );
+
+  return pages.map((page, index) => ({
+    ...base,
+    id: `${bvid ?? aid}:${page.cid}`,
+    cid: page.cid,
+    title: page.part || `${videoTitle} P${page.page ?? index + 1}`,
+    album: videoTitle,
+    duration: durationToSec(page.duration),
+    page: page.page ?? index + 1,
+    parentTitle: videoTitle,
+    _expandedMultiPage: true,
+  }));
 }
 
 async function getUploaderName(mid, referer) {
@@ -443,6 +562,13 @@ async function expandImportedMediaItems(items) {
 }
 
 async function importSingleMusicSheet(input) {
+  input = await resolveB23Url(input);
+
+  const videoIdentifier = parseVideoIdentifier(input);
+  if (videoIdentifier) {
+    return await getSingleVideoList(videoIdentifier, input);
+  }
+
   const listMatch = input.match(/space\.bilibili\.com\/(\d+)\/lists\/(\d+)/i);
   if (listMatch) {
     const mid = listMatch[1];
@@ -460,7 +586,7 @@ async function importSingleMusicSheet(input) {
   if (!id) id = input.match(/\/list\/ml(\d+)/i)?.[1];
 
   if (id) return await getFavoriteList(id);
-  throw new Error("无法识别该链接或歌单 ID");
+  throw new Error("无法识别该 B站视频、合集、系列、收藏夹链接或 ID");
 }
 
 async function importMusicSheet(urlLike) {
@@ -767,10 +893,10 @@ async function getAlbumInfo(albumItem) {
 module.exports = {
   platform: "bilibili合集",
   appVersion: ">=0.0",
-  version: "0.5.2",
+  version: "0.5.3",
   author: "3ll3-3ll3",
   description:
-    "Bilibili 合集/系列批量导入；四档音质 + 可配置分钟级时长过滤",
+    "Bilibili 合集/系列/单视频选集导入；四档音质 + 可配置分钟级时长过滤",
   srcUrl:
     "https://raw.githubusercontent.com/3ll3-3ll3/musicfree-bilibili-collection/main/musicfree_bilibili_collection.js",
   cacheControl: "no-cache",
@@ -794,7 +920,9 @@ module.exports = {
 
   hints: {
     importMusicSheet: [
-      "v0.5.2 新增时长过滤：maxDurationMinutes 填分钟数，例如 30 / 60；0 或留空表示不限",
+      "v0.5.3 支持直接粘贴 BV/AV 视频链接、裸 BV/av ID；多P/视频选集会自动拆成独立歌曲",
+      "支持 b23.tv 短链自动解析，手机分享链接可直接尝试导入",
+      "时长过滤：maxDurationMinutes 填分钟数，例如 30 / 60；0 或留空表示不限",
       "超过上限的内容不会进入导入结果；多P视频按每个分P自身时长分别判断",
       "下载时还会再次校验时长，因此旧歌单中的超长条目也会被阻止下载",
       "四档音质：low=省流AAC，standard=标准AAC，high=最高AAC，super=FLAC优先",

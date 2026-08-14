@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-`v0.5.2`
+`v0.5.3`
 
 ## 当前核心功能
 
@@ -13,10 +13,34 @@
 - 兼容公开收藏夹 URL / fid / pl / ml / 数字收藏夹 ID
 - 支持一次粘贴多个歌单链接，一行一个，自动识别、合并并去重
 - 自动识别多P视频，并将每个分P展开成独立歌曲
+- 支持直接粘贴单个 BV/AV 视频链接或裸 BV/av ID，将视频选集直接当作歌单导入
+- 支持 `b23.tv` 短链接自动解析
 - 保持外层合集顺序和多P内部顺序
 - 多P去重优先使用 `bvid + cid`
 - 可选 B站 Cookie，用于账号本身有权访问的内容/音质
 - 支持按分钟设置最大音频时长，自动过滤超长内容
+
+## v0.5.3：单视频 / 视频选集直接导入
+
+现在可以把普通 B站视频直接作为歌单导入，无需先找到它所属的收藏夹或空间合集。
+
+支持：
+
+```text
+https://www.bilibili.com/video/BVxxxxxxxxxx/
+BVxxxxxxxxxx
+https://www.bilibili.com/video/av123456/
+av123456
+https://b23.tv/xxxxxx
+```
+
+如果视频本身有多个分P/“视频选集”，插件会读取每个 `page` 的独立 `cid`、标题和时长，并直接展开为独立歌曲。导入 MusicFree 后，每个选集都是独立条目；`maxDurationMinutes` 仍按每个分P自己的时长过滤，下载也按每个分P自己的 `cid` 获取音频。
+
+例如这类链接可以直接导入：
+
+```text
+https://www.bilibili.com/video/BV1GStwexEXB/
+```
 
 ## v0.5.2：可配置时长过滤
 
